@@ -1,13 +1,14 @@
 /*
-Infer prior beliefs about multivariate Gaussian categories based on (pre- or post-)
+Infer prior beliefs about multipe univariate Gaussian categories based on (pre- or post-)
 exposure categorization responses.
 
 Assumptions:
 
-(1) Beliefs about each category are assumed to have the form of multivariate
-    Normal-inverse-Wishart distributions, with unknown (inferred) m, S, kappa,
-    and nu parameters describing uncertainty about the joint distribution of
-    cues for this category.
+(1) Beliefs about each category are assumed to have the form of multiple
+    independent univariate Normal-inverse-Wishart distributions, with unknown
+    (inferred) m, S, kappa, and nu parameters describing uncertainty about the
+    independent distributions of each cue for this category. During categorization,
+    these independent beliefs about each cue are integrated (cue integration).
 (2) Beliefs for each category are independent of each other.
 (3) Subjects know the true labels of all the exposure stimuli.
 (4) Categorization has uniform decision-biases with unknown (inferred) lapse rate.
@@ -35,6 +36,10 @@ data {
   matrix[M,L] N;                // number of observations per category (M) and exposure group (L)
   vector[K] x_mean[M,L];        // means for each category (M) and exposure group (L)
   cov_matrix[K] x_ss[M,L];      // sum of uncentered squares matrix for each category (M) and group (L)
+
+  // Can beliefs about each cue have different strengths?
+  int<lower=0, upper=1> multiple_kappa_0;  // 0: same kappa_0 for all features, 1: different kappa_0 for each feature
+  int<lower=0, upper=1> multiple_nu_0;     // 0: same nu_0 for all features, 1: different nu_0 for each feature
 
   int N_test;                   // number of unique combinations of test locations & exposure groups
   vector[K] x_test[N_test];     // locations (in cue space) of test trials
@@ -66,9 +71,10 @@ transformed data {
 }
 
 parameters {
-  // Strength of prior beliefs are shared across groups (same prior beliefs):
-  real<lower=K> kappa_0;                  // prior pseudocount for category mu
-  real<lower=K + 1> nu_0;                 // prior pseudocount for category Sigma
+  // Strength of prior beliefs are shared across groups (same prior beliefs)
+  // but can differ for each cue
+  vector<lower=K>[multiple_kappa_0 ? K : 1] kappa_0;        // prior pseudocount for category mu
+  vector<lower=K + 1>[multiple_nu_0 ? K : 1] nu_0;          // prior pseudocount for category Sigma
 
   real<lower=0, upper=1> lapse_rate_param[lapse_rate_known ? 0 : 1];
 
@@ -85,9 +91,9 @@ transformed parameters {
   vector[K] m_0[M];                    // prior mean of means m_0
   cov_matrix[K] S_0[M];                // prior scatter matrix S_0
 
-  // Updated beliefs depend on input and group
-  real<lower=K> kappa_n[M,L];          // updated mean pseudocount
-  real<lower=K> nu_n[M,L];             // updated sd pseudocount
+  // Updated beliefs depend on input and group, and can differ between cues
+  vector<lower=K>[multiple_kappa_0 ? K : 1] kappa_n[M,L];    // updated mean pseudocount
+  vector<lower=K>[multiple_nu_0 ? K : 1] nu_n[M,L];          // updated sd pseudocount
   vector[K] m_n[M,L];                  // updated expected mean
   cov_matrix[K] S_n[M,L];              // updated expected scatter matrix
   cov_matrix[K] t_scale[M,L];          // scale matrix of predictive t distribution
@@ -112,23 +118,35 @@ transformed parameters {
     }
   }
 
-  // Update NIW parameters according to conjugate updating rules are taken from
-  // Murphy (2007, p. 136)
+  // update NIX parameters according to conjugate updating rules are taken from
+  // Murphy (2007, p. XXX)
   for (cat in 1:M) {
-    if (!Sigma_0_known) {
-      // Get S_0 from its components: correlation matrix and vector of standard deviations
-      S_0[cat] = quad_form_diag(multiply_lower_tri_self_transpose(L_omega_0_param[cat]), tau_0_param[cat]);
-    }
     for (group in 1:L) {
       if (N[cat,group] > 0 ) {
         kappa_n[cat,group] = kappa_0 + N[cat,group];
         nu_n[cat,group] = nu_0 + N[cat,group];
-        m_n[cat,group] = (kappa_0 * m_0[cat] + N[cat,group] * x_mean[cat,group]) /
-        kappa_n[cat,group];
-        S_n[cat,group] = S_0[cat] +
-        x_ss[cat,group] +
-        kappa_0 * m_0[cat] * m_0[cat]' -
-        kappa_n[cat,group] * m_n[cat,group] * m_n[cat,group]';
+        if (multiple_kappa_0) {
+          m_n[cat,group] = (kappa_0 .* m_0[cat] + N[cat,group] * x_mean[cat,group]) ./ kappa_n[cat,group];
+        } else {
+          m_n[cat,group] = (kappa_0[1] * m_0[cat] + N[cat,group] * x_mean[cat,group]) / kappa_n[cat,group,1];
+        }
+
+        if (multiple_nu_0 && multiple_kappa_0) {
+          S_n[cat,group] = sqrt(
+            (nu_0 .* (S_0[cat] .* S_0[cat]) +
+            x_ss[cat,group] +
+            ((kappa_0 * N[cat,group]) ./ kappa_n[cat,group]) .*
+            (m_0[cat] - x_mean[cat,group]) .* (m_0[cat] - x_mean[cat,group])) ./
+            nu_n[cat,group]);
+        } else {
+          // NEED TO HANDLE CASES WHEN ONLY ONE OF MULTIPLE_NU_0 OR MULTIPLE_KAPPA_0 IS TRUE
+          S_n[cat,group] = sqrt(
+            (nu_0[1] * (S_0[cat] .* S_0[cat]) +
+            x_ss[cat,group] +
+            ((kappa_0[1] * N[cat,group]) / kappa_n[cat,group,1]) *
+            (m_0[cat] - x_mean[cat,group]) .* (m_0[cat] - x_mean[cat,group])) /
+            nu_n[cat,group, 1]);
+        }
       } else {
         kappa_n[cat,group] = kappa_0;
         nu_n[cat,group] = nu_0;
@@ -136,8 +154,8 @@ transformed parameters {
         S_n[cat,group] = S_0[cat];
       }
 
-      t_scale[cat,group] = S_n[cat,group] * (kappa_n[cat,group] + 1) /
-      (kappa_n[cat,group] * (nu_n[cat,group] - K + 1));
+      t_scale[cat,group] = S_n[cat,group] .* (kappa_n[cat,group] + 1) ./
+                           (kappa_n[cat,group] .* (nu_n[cat,group] - K + 1));
     }
   }
 
